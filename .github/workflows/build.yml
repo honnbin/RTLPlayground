@@ -57,5 +57,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-output
-          path: output/         # 根据你的代码，编译产物在 output 目录下
+          # 同时上传 branch 和 main 目录下的 output 文件夹
+          path: |
+            branch/output/
+            main/output/
           if-no-files-found: warn
