@@ -53,3 +53,12 @@ jobs:
       - name: Calculate bank growth
         run: |
           bash branch/tools/bank_occupancy.sh KP_9000_6XHML_X2 /tmp/main /tmp/branch >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload Firmware Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-output
+          # 同时上传 branch 和 main 目录下的 output 文件夹
+          path: |
+            branch/output/
+            main/output/
+          if-no-files-found: warn
