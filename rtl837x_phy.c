@@ -279,6 +279,7 @@ void phy_set_speed(void) __banked
 	uint16_t v;
 
 	print_string("Setting port "); print_phys_port(phy_settings.port);
+	phy_settings.is10g_port = 0;
 	if (machine.n_10g && phy_settings.port == 3)
 		phy_settings.is10g_port = 1;
 	if (machine.n_10g == 2 && phy_settings.port == 8)
@@ -427,15 +428,15 @@ void phy_set_duplex(void) __banked
 	v = SFR_DATA_U16;
 	if (v & 0x0060) {
 		if (phy_settings.duplex)
-			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0xffbf, 0x0040);
+			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0x0060, 0x0040);
 		else
-			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0xffdf, 0x0020);
+			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0x0060, 0x0020);
 	}
 	if (v & 0x0180) {
 		if (phy_settings.duplex)
-			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0xfeff, 0x0100);
+			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0x0180, 0x0100);
 		else
-			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0xff7f, 0x0080);
+			phy_modify(phy_settings.port, PHY_MMD_AN, PHY_ANEG_ADV, 0x0180, 0x0080);
 	}
 	// Restart AN
 	phy_write(phy_settings.port, PHY_MMD_AN, PHY_ANEG_CTRL, 0x3000);

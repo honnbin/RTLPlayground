@@ -196,7 +196,7 @@ __xdata static u16_t lastport;       /* Keeps track of the last port used for
 
 /* Temporary variables. */
 __xdata u8_t uip_acc32[4];
-static __xdata u8_t c, opt;
+static __xdata u8_t c;
 static __xdata u16_t tmp16;
 
 /* Structures and definitions. */
@@ -683,6 +683,57 @@ uip_add_rcv_nxt(u16_t n)
   uip_conn->rcv_nxt[1] = uip_acc32[1];
   uip_conn->rcv_nxt[2] = uip_acc32[2];
   uip_conn->rcv_nxt[3] = uip_acc32[3];
+}
+/*---------------------------------------------------------------------------*/
+static void
+process_tcp_options(__xdata struct uip_conn *conn)
+{
+  u8_t opt, optlen, pos, len;
+  u16_t mss;
+
+  if((BUF->tcpoffset & 0xf0) <= 0x50) {
+    return;
+  }
+
+  /* The option area follows the 20-byte base header. The data offset is a
+     4-bit field, so it is at most 40 bytes; pos stays within it and cannot
+     wrap. Parse the TCP MSS option, if present. */
+  optlen = ((BUF->tcpoffset >> 4) - 5) << 2;
+  for(pos = 0; pos < optlen; ) {
+    opt = uip_buf[UIP_LLH_LEN + UIP_IPTCPH_LEN + pos];
+    if(opt == TCP_OPT_END) {
+      /* Stop processing options. */
+      return;
+    }
+    if(opt == TCP_OPT_NOOP) {
+      pos++;
+      continue;
+    }
+    /* Every other option carries a length byte covering itself; it and the
+       option body must fit the remaining option area. */
+    if(optlen - pos < 2) {
+      return;
+    }
+    len = uip_buf[UIP_LLH_LEN + UIP_IPTCPH_LEN + pos + 1];
+    if(len < 2 || len > optlen - pos) {
+      /* A missing or oversized length is malformed; stop. */
+      return;
+    }
+    if(opt == TCP_OPT_MSS && len == TCP_OPT_MSS_LEN) {
+      mss = ((u16_t)uip_buf[UIP_LLH_LEN + UIP_IPTCPH_LEN + pos + 2] << 8) |
+	(u16_t)uip_buf[UIP_LLH_LEN + UIP_IPTCPH_LEN + pos + 3];
+      /* Clamp to our maximum. An MSS of 0 is ignored and the default kept:
+	 uip_send clamps uip_slen to conn->mss, so a 0 would leave a
+	 connection that can never send and holds its slot until the
+	 application times out. */
+      if(mss != 0) {
+	conn->initialmss = conn->mss = mss > UIP_TCP_MSS ? UIP_TCP_MSS : mss;
+      }
+      /* Stop processing options. */
+      return;
+    }
+    pos += len;
+  }
 }
 /*---------------------------------------------------------------------------*/
 void
@@ -1374,39 +1425,11 @@ uip_process(u8_t flag) __banked
   uip_connr->rcv_nxt[0] = BUF->seqno[0];
   uip_add_rcv_nxt(1);
 
-  /* Parse the TCP MSS option, if present. */
-  if((BUF->tcpoffset & 0xf0) > 0x50) {
-    for(c = 0; c < ((BUF->tcpoffset >> 4) - 5) << 2 ;) {
-      opt = uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + c];
-      if(opt == TCP_OPT_END) {
-	/* End of options. */
-	break;
-      } else if(opt == TCP_OPT_NOOP) {
-	++c;
-	/* NOP option. */
-      } else if(opt == TCP_OPT_MSS &&
-		uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 1 + c] == TCP_OPT_MSS_LEN) {
-	/* An MSS option with the right option length. */
-	tmp16 = ((u16_t)uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 2 + c] << 8) |
-	  (u16_t)uip_buf[UIP_IPTCPH_LEN + UIP_LLH_LEN + 3 + c];
-	uip_connr->initialmss = uip_connr->mss =
-	  tmp16 > UIP_TCP_MSS? UIP_TCP_MSS: tmp16;
-	
-	/* And we are done processing options. */
-	break;
-      } else {
-	/* All other options have a length field, so that we easily
-	   can skip past them. */
-	if(uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 1 + c] == 0) {
-	  /* If the length field is zero, the options are malformed
-	     and we don't process them further. */
-	  break;
-	}
-	c += uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 1 + c];
-      }
-    }
-  }
-  
+  /* Default the MSS, as uip_connect does for an active open: a SYN without
+     a usable MSS option would otherwise leave a stale or zero MSS. */
+  uip_connr->initialmss = uip_connr->mss = UIP_TCP_MSS;
+  process_tcp_options(uip_connr);
+
   /* Our response will be a SYNACK. */
 #if UIP_ACTIVE_OPEN
  tcp_send_synack:
@@ -1449,6 +1472,12 @@ uip_process(u8_t flag) __banked
   /* Calculated the length of the data, if the application has sent
      any data to us. */
   c = (BUF->tcpoffset >> 4) << 2;
+  /* Check that the indicated length of the TCP header is not too large
+     for the total packet length, or the subtraction below underflows
+     uip_len and uip_appdata reaches past uip_buf. */
+  if(uip_len < c + UIP_IPH_LEN) {
+    goto drop;
+  }
   /* uip_len will contain the length of the actual TCP data. This is
      calculated by subtracing the length of the TCP header (in
      c) and the length of the IP header (20 bytes). */
@@ -1545,38 +1574,7 @@ uip_process(u8_t flag) __banked
     if((uip_flags & UIP_ACKDATA) &&
        (BUF->flags & TCP_CTL) == (TCP_SYN | TCP_ACK)) {
 
-      /* Parse the TCP MSS option, if present. */
-      if((BUF->tcpoffset & 0xf0) > 0x50) {
-	for(c = 0; c < ((BUF->tcpoffset >> 4) - 5) << 2 ;) {
-	  opt = uip_buf[UIP_IPTCPH_LEN + UIP_LLH_LEN + c];
-	  if(opt == TCP_OPT_END) {
-	    /* End of options. */
-	    break;
-	  } else if(opt == TCP_OPT_NOOP) {
-	    ++c;
-	    /* NOP option. */
-	  } else if(opt == TCP_OPT_MSS &&
-		    uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 1 + c] == TCP_OPT_MSS_LEN) {
-	    /* An MSS option with the right option length. */
-	    tmp16 = (uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 2 + c] << 8) |
-	      uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 3 + c];
-	    uip_connr->initialmss =
-	      uip_connr->mss = tmp16 > UIP_TCP_MSS? UIP_TCP_MSS: tmp16;
-
-	    /* And we are done processing options. */
-	    break;
-	  } else {
-	    /* All other options have a length field, so that we easily
-	       can skip past them. */
-	    if(uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 1 + c] == 0) {
-	      /* If the length field is zero, the options are malformed
-		 and we don't process them further. */
-	      break;
-	    }
-	    c += uip_buf[UIP_TCPIP_HLEN + UIP_LLH_LEN + 1 + c];
-	  }
-	}
-      }
+      process_tcp_options(uip_connr);
       uip_connr->tcpstateflags = UIP_ESTABLISHED;
       uip_connr->rcv_nxt[0] = BUF->seqno[0];
       uip_connr->rcv_nxt[1] = BUF->seqno[1];
@@ -1642,26 +1640,32 @@ uip_process(u8_t flag) __banked
       goto tcp_send_nodata;
     }
 
-    /* Check the URG flag. If this is set, the segment carries urgent
-       data that we must pass to the application. */
-    if((BUF->flags & TCP_URG) != 0) {
 #if UIP_URGDATA > 0
-      uip_urglen = (BUF->urgp[0] << 8) | BUF->urgp[1];
-      if(uip_urglen > uip_len) {
-	/* There is more urgent data in the next segment to come. */
-	uip_urglen = uip_len;
+    /* Check the URG flag. If this is set, the segment carries urgent data
+       that we must pass to the application out of band. */
+    if((BUF->flags & TCP_URG) != 0) {
+      tmp16 = (BUF->urgp[0] << 8) | BUF->urgp[1];
+      if(tmp16 > uip_len) {
+	/* There is more urgent data in the next segment to come. Cap the
+	   urgent data length at the segment length for further processing. */
+	tmp16 = uip_len;
       }
+      uip_urglen = tmp16;
       uip_add_rcv_nxt(uip_urglen);
       uip_len -= uip_urglen;
       uip_urgdata = uip_appdata;
       uip_appdata += uip_urglen;
     } else {
       uip_urglen = 0;
-#else /* UIP_URGDATA > 0 */
-      uip_appdata = ((char *)uip_appdata) + ((BUF->urgp[0] << 8) | BUF->urgp[1]);
-      uip_len -= (BUF->urgp[0] << 8) | BUF->urgp[1];
-#endif /* UIP_URGDATA > 0 */
     }
+#else /* UIP_URGDATA > 0 */
+    /* The urgent pointer is ignored and any urgent data is delivered to the
+       application inline, as RFC 6093 (Section 2.1) recommends. Advancing
+       uip_appdata past it by the urgent pointer instead moved the pointer
+       outside uip_buf (CVE-2020-17437) and left rcv_nxt short of the bytes
+       so consumed. uip_len then carries the whole segment to the normal data
+       path below, which acknowledges it. */
+#endif /* UIP_URGDATA > 0 */
 
     /* If uip_len > 0 we have TCP data in the packet, and we flag this
        by setting the UIP_NEWDATA flag and update the sequence number

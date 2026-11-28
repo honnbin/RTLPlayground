@@ -140,7 +140,8 @@ void print_string_newline_no_syslog(const char *p) { (void)p; }
 void set_sys_led_state(uint8_t state) { (void)state; }
 void cmd_parser(void) { }
 void execute_config(void) { }
-void execute_commands(uint8_t *p) { (void)p; }
+static unsigned exec_calls;
+void execute_commands(uint8_t *p) { (void)p; exec_calls++; }
 void clear_command_history(void) { }
 void udp_callbacks(void) { }
 void tcpip_output(void) { }
@@ -207,6 +208,7 @@ extern u16_t uip_listenports[UIP_LISTENPORTS];
 static uint32_t cli_seq;	/* next sequence number we send */
 static uint32_t cli_rcv_nxt;	/* next sequence number we expect */
 static uint16_t cli_window;	/* what we advertise */
+static uint16_t cli_urgp;	/* urgent pointer, sent when TCP_URG is set */
 
 static uint8_t stream[STREAM_MAX];	/* bytes accepted from the server */
 static int stream_len;
@@ -314,6 +316,8 @@ static void client_send(uint8_t flags, const char *payload, int plen)
 	TCPH->wnd[0] = (uint8_t)(cli_window >> 8);
 	TCPH->wnd[1] = (uint8_t)(cli_window & 0xff);
 	TCPH->tcpchksum = 0;
+	TCPH->urgp[0] = (uint8_t)(cli_urgp >> 8);
+	TCPH->urgp[1] = (uint8_t)(cli_urgp & 0xff);
 
 	if (hlen == 24) {
 		uint8_t *opt = &uip_buf[UIP_LLH_LEN + 40];
@@ -548,6 +552,144 @@ static void scenario_bad_l4_checksum(void)
 	      "bad checksum control: the same request with a good flag is served");
 	CHECK(first_body_mismatch() == -1,
 	      "bad checksum control: the file that follows is intact");
+}
+
+/* Lay a bare IPv4/TCP header into uip_buf with a chosen data offset and option
+ * bytes, so a malformed header can be fed to uip_input() directly. */
+static void put_tcp(uint8_t flags, uint8_t offset_words, const uint8_t *opt, int optlen,
+		    uint32_t seq, uint16_t total_len)
+{
+	memset(uip_buf, 0, UIP_LLH_LEN + 20 + 20 + (optlen > 0 ? optlen : 0));
+	TCPH->vhl = 0x45;
+	TCPH->len[0] = (uint8_t)(total_len >> 8);
+	TCPH->len[1] = (uint8_t)(total_len & 0xff);
+	TCPH->ttl = 64;
+	TCPH->proto = UIP_PROTO_TCP;
+	TCPH->srcipaddr[0] = hton16(0x0a00); TCPH->srcipaddr[1] = hton16(0x0002);
+	TCPH->destipaddr[0] = hton16(0x0a00); TCPH->destipaddr[1] = hton16(0x0001);
+	TCPH->srcport = hton16(40000);
+	TCPH->destport = hton16(80);
+	wr32(TCPH->seqno, seq);
+	wr32(TCPH->ackno, cli_rcv_nxt);
+	TCPH->tcpoffset = (uint8_t)(offset_words << 4);
+	TCPH->flags = flags;
+	TCPH->wnd[0] = (uint8_t)(cli_window >> 8);
+	TCPH->wnd[1] = (uint8_t)(cli_window & 0xff);
+	if (optlen > 0)
+		memcpy(&uip_buf[UIP_LLH_LEN + 40], opt, optlen);
+}
+
+/* A SYN whose option walk, left unbounded, never terminates: NOOP, then an
+ * unknown option of length 255 that wraps an 8-bit cursor from 1 back to 0.
+ * With the walk bounded, the SYN is parsed and a SYN-ACK goes out. If this
+ * ever regresses the walk spins and the bench hangs - that is the symptom. */
+static void scenario_malformed_tcp_options(void)
+{
+	static const uint8_t opts[4] = { 0x01, 0x03, 0xff, 0x00 };
+
+	uip_init();
+	httpd_init();
+	cli_window = MSS_FULL;
+	cli_rcv_nxt = 0;
+	/* uip_init leaves the slot's MSS alone; clear it so the default is seen. */
+	uip_conns[0].initialmss = uip_conns[0].mss = 0;
+	put_tcp(TCP_SYN, 6 /* 24-byte header */, opts, sizeof(opts), 1000, 44);
+	uip_len = 44;
+	uip_input();
+	CHECK(uip_len && (TCPH->flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK),
+	      "malformed SYN options: the walk terminates and a SYN-ACK is sent");
+	CHECK(uip_conns[0].mss == UIP_TCP_MSS && uip_conns[0].initialmss == UIP_TCP_MSS,
+	      "malformed SYN options: no MSS is parsed, the connection keeps the default");
+}
+
+/* A segment claiming a 60-byte TCP header (data offset 15) while only 40 bytes
+ * arrived. Unguarded, uip_len underflows and uip_appdata is carried past
+ * uip_buf (ASan catches the read). Guarded, the segment is dropped and the
+ * connection keeps working. */
+static void scenario_oversized_data_offset(void)
+{
+	session_start(MSS_FULL);
+	put_tcp(TCP_ACK, 15 /* 60-byte header */, NULL, 0, cli_seq, 40);
+	uip_len = 40;
+	uip_input();
+	CHECK(uip_conn_active(0),
+	      "oversized data offset: the segment is dropped, the connection survives");
+
+	stream_len = 0;
+	request_file(MSS_FULL);
+	drain(MSS_FULL);
+	CHECK(first_body_mismatch() == -1,
+	      "oversized data offset: a normal request after it still serves the file");
+}
+
+/* A SYN advertising MSS 0 (option 02 04 00 00). uip_send clamps to conn->mss,
+ * so storing 0 would leave a connection that can never send and holds its slot
+ * until timeout. The option must be ignored and the default MSS kept. */
+static void scenario_mss_zero(void)
+{
+	static const uint8_t mss0[4] = { 0x02, 0x04, 0x00, 0x00 };
+
+	uip_init();
+	httpd_init();
+	cli_window = MSS_FULL;
+	cli_rcv_nxt = 0;
+	/* uip_init leaves the slot's MSS alone; clear it so the default is seen. */
+	uip_conns[0].initialmss = uip_conns[0].mss = 0;
+	put_tcp(TCP_SYN, 6 /* 24-byte header */, mss0, sizeof(mss0), 1000, 44);
+	uip_len = 44;
+	uip_input();
+	CHECK(uip_conns[0].mss == UIP_TCP_MSS && uip_conns[0].initialmss == UIP_TCP_MSS,
+	      "an advertised MSS of 0 is ignored, the connection keeps the default");
+}
+
+#define TCP_URG 0x20
+
+/* A segment with URG set and an urgent pointer past the payload. Advancing
+ * uip_appdata by the urgent pointer ran httpd off the end of uip_buf
+ * (CVE-2020-17437, ASan SEGVs without the fix); delivered inline, the byte is
+ * just data and the connection carries on. */
+static void scenario_urg_inline(void)
+{
+	session_start(MSS_FULL);
+
+	memset(uip_buf, 0, UIP_LLH_LEN + 41);
+	TCPH->vhl = 0x45;
+	TCPH->len[0] = 0; TCPH->len[1] = 41;	/* 20 IP + 20 TCP + 1 data */
+	TCPH->ttl = 64;
+	TCPH->proto = UIP_PROTO_TCP;
+	TCPH->srcipaddr[0] = hton16(0x0a00); TCPH->srcipaddr[1] = hton16(0x0002);
+	TCPH->destipaddr[0] = hton16(0x0a00); TCPH->destipaddr[1] = hton16(0x0001);
+	TCPH->srcport = hton16(40000);
+	TCPH->destport = hton16(80);
+	wr32(TCPH->seqno, cli_seq);
+	wr32(TCPH->ackno, cli_rcv_nxt);
+	TCPH->tcpoffset = 5 << 4;
+	TCPH->flags = TCP_ACK | TCP_URG;
+	TCPH->wnd[0] = MSS_FULL >> 8; TCPH->wnd[1] = MSS_FULL & 0xff;
+	TCPH->urgp[0] = 0; TCPH->urgp[1] = 2;	/* urgent pointer one past the byte */
+	uip_buf[UIP_LLH_LEN + 40] = 'x';
+	uip_len = 41;
+	uip_input();
+	CHECK(uip_conn_active(0),
+	      "URG segment: delivered inline, no out-of-bounds, connection survives");
+	CHECK(uip_len == 40 && rd32(TCPH->ackno) == cli_seq + 1,
+	      "URG segment: the byte is acknowledged, rcv_nxt moves by exactly one");
+}
+
+/* A GET with URG set and the urgent pointer inside the request. Delivered
+ * inline, httpd sees the whole request and serves the file; skipping the
+ * urgent bytes instead would leave it a request with its start missing. */
+static void scenario_urg_get(void)
+{
+	static const char get[] = "GET " FILE_NAME " HTTP/1.1\r\nHost: sw\r\n\r\n";
+
+	session_start(MSS_FULL);
+	cli_urgp = 4;
+	client_send(TCP_ACK | TCP_PSH | TCP_URG, get, (int)strlen(get));
+	cli_urgp = 0;
+	drain(MSS_FULL);
+	CHECK(first_body_mismatch() == -1,
+	      "URG GET: the request is read inline and the file is served");
 }
 
 
@@ -997,6 +1139,35 @@ static void scenario_fragmented_get_without_cookie(void)
 	      "fragmented GET without cookie: authentication is not carried over");
 }
 
+static void scenario_post_path_without_separator(void)
+{
+	static const char logged_in[] =
+		"POST /cmd HTTP/1.1\r\n"
+		"Cookie: session=0123456789ab\r\n"
+		"Content-Length: 7\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"vlan 5\n";
+	static const char bare[] = "POST /cmd\r\n\r\nvlan 6\n";
+
+	session_start(MSS_FULL);
+	strcpy(session_id, "0123456789ab");
+	last_session_use[0] = fake_now;
+	exec_calls = 0;
+	client_send(TCP_ACK | TCP_PSH, logged_in, (int)strlen(logged_in));
+	CHECK(exec_calls == 1,
+	      "POST path without separator: control request with a cookie runs");
+
+	session_start(MSS_FULL);
+	strcpy(session_id, "0123456789ab");
+	last_session_use[0] = fake_now;
+	client_send(TCP_ACK | TCP_PSH, bare, (int)strlen(bare));
+	CHECK(exec_calls == 1,
+	      "POST path without separator: headers of the previous request do not authenticate it");
+	CHECK(stream_contains("HTTP/1.1 400 Bad Request\r\n"),
+	      "POST path without separator: the request is refused");
+}
+
 static void scenario_get_header_timeout(void)
 {
 	static const char partial[] =
@@ -1304,6 +1475,11 @@ int main(int argc, char **argv)
 	scenario_growing_window();
 	scenario_rexmit_after_shrink();
 	scenario_bad_l4_checksum();
+	scenario_malformed_tcp_options();
+	scenario_oversized_data_offset();
+	scenario_mss_zero();
+	scenario_urg_inline();
+	scenario_urg_get();
 	scenario_upload_reset_owner();
 	scenario_fragmented_post_header();
 	scenario_split_content_type();
@@ -1318,6 +1494,7 @@ int main(int argc, char **argv)
 	scenario_fragmented_get_cookie_value();
 	scenario_split_get_header_terminator();
 	scenario_fragmented_get_without_cookie();
+	scenario_post_path_without_separator();
 	scenario_get_header_timeout();
 	scenario_oversized_get_header();
 	scenario_split_method_names();
